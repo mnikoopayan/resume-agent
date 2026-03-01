@@ -37,7 +37,7 @@ The system follows a multi-agent architecture where a **Coordinator Agent** rout
 
 **Dropbox Monitoring** — Watchdog-based file system monitor that auto-ingests new documents dropped into a watched folder, with SHA-256 deduplication and optional candidate auto-creation.
 
-**Enhanced Web Dashboard** — FastAPI server with a tabbed browser UI featuring Chat (conversational agent access), Pipeline (candidate table with filtering), and Analytics (statistics and charts) views.
+**Web Dashboard** — FastAPI server with a tabbed browser UI featuring Chat (conversational agent access), Pipeline (candidate table with filtering), and Analytics (statistics and charts) views.
 
 ## Project Structure
 
