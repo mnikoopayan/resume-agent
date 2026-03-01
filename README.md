@@ -1,4 +1,4 @@
-# Enhanced Resume Agent
+#  Resume Agent
 
 A production-grade, multi-agent recruitment pipeline built with the **Agno** framework and **OpenRouter** LLM integration. This system automates resume ingestion, candidate profiling, scoring, interview scheduling, email communication, and pipeline analytics through a team of specialized AI agents coordinated by a central orchestrator.
 
