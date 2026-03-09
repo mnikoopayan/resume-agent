@@ -59,3 +59,8 @@ google_api_server/token.json
 # OS
 .DS_Store
 Thumbs.db
+
+google_api_server/.oauth_state_cache.json
+google_api_server/token_readonly.json
+knowledge/*.db-shm
+knowledge/*.db-wal
