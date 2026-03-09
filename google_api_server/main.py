@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,9 @@ from tools.gmail_tools import SmtpGmailSender
 from tools.calendar_tools import CalendarService
 from tools.analytics import AnalyticsEngine
 from agent.coordinator import create_coordinator_agent
+from workflows.new_application import NewApplicationWorkflow
+from workflows.interview_scheduling import InterviewSchedulingWorkflow
+from workflows.candidate_ranking import CandidateRankingWorkflow
 
 # Scopes for Calendar (full) and Gmail (read)
 SCOPES = [
@@ -88,11 +91,6 @@ _SINGLETONS: Dict[str, Any] = {}
 
 # ---------------------------------------------------------------------------
 # OAuth PKCE state cache
-#
-# Newer google-auth-oauthlib / requests-oauthlib flows may use PKCE.
-# If PKCE is used, Google expects `code_verifier` in the token exchange step.
-# Because /auth and /callback are separate HTTP requests, we persist the
-# code_verifier keyed by `state` (in-memory + on-disk) so /callback can reuse it.
 # ---------------------------------------------------------------------------
 _OAUTH_FLOW_CACHE: Dict[str, Any] = {}
 _OAUTH_STATE_LOCK = threading.Lock()
@@ -115,7 +113,6 @@ def _save_oauth_state_cache(cache: Dict[str, Any]) -> None:
         tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
         tmp.replace(_OAUTH_STATE_CACHE_FILE)
     except Exception:
-        # Best-effort only (local dev server)
         pass
 
 
@@ -133,8 +130,6 @@ def _prune_oauth_state_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _get_flow_code_verifier(flow: Any) -> Optional[str]:
-    # google-auth-oauthlib may expose it as flow.code_verifier, while requests-oauthlib
-    # keeps it at flow.oauth2session._client.code_verifier
     try:
         cv = getattr(flow, "code_verifier", None)
         if cv:
@@ -151,7 +146,6 @@ def _get_flow_code_verifier(flow: Any) -> Optional[str]:
 
 
 def _attach_code_verifier(flow: Any, code_verifier: str) -> None:
-    # Attach verifier in both likely places to satisfy requests-oauthlib
     try:
         setattr(flow, "code_verifier", code_verifier)
     except Exception:
@@ -160,7 +154,6 @@ def _attach_code_verifier(flow: Any, code_verifier: str) -> None:
         flow.oauth2session._client.code_verifier = code_verifier
     except Exception:
         pass
-
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -221,6 +214,33 @@ def _get_analytics() -> AnalyticsEngine:
     return _SINGLETONS["analytics"]
 
 
+def _get_knowledge_tool() -> Optional[InsertKnowledgeTool]:
+    if "knowledge_tool" not in _SINGLETONS:
+        try:
+            config = _get_config()
+            knowledge_base = create_knowledge_base(config)
+            _SINGLETONS["knowledge_tool"] = InsertKnowledgeTool(knowledge_base)
+        except Exception as exc:
+            logger.warning("Knowledge base unavailable for workflow endpoint: %s", exc)
+            _SINGLETONS["knowledge_tool"] = None
+    return _SINGLETONS["knowledge_tool"]
+
+
+def _get_calendar_service() -> CalendarService:
+    if "calendar_service" not in _SINGLETONS:
+        _SINGLETONS["calendar_service"] = CalendarService(
+            credentials_path=str(CREDENTIALS_FILE),
+            token_path=str(TOKEN_FILE),
+        )
+    return _SINGLETONS["calendar_service"]
+
+
+def _get_smtp_sender() -> SmtpGmailSender:
+    if "smtp_sender" not in _SINGLETONS:
+        _SINGLETONS["smtp_sender"] = SmtpGmailSender()
+    return _SINGLETONS["smtp_sender"]
+
+
 def _get_chat_agent():
     if "chat_agent" not in _SINGLETONS:
         config = _get_config()
@@ -231,11 +251,8 @@ def _get_chat_agent():
         classifier = _get_classifier()
         template_engine = _get_template_engine()
         analytics = _get_analytics()
-        smtp_sender = SmtpGmailSender()
-        calendar_service = CalendarService(
-            credentials_path=str(CREDENTIALS_FILE),
-            token_path=str(TOKEN_FILE),
-        )
+        smtp_sender = _get_smtp_sender()
+        calendar_service = _get_calendar_service()
 
         enable_gmail = _env_bool("ENABLE_GMAIL_TOOLS", default=True)
         agent = create_coordinator_agent(
@@ -257,14 +274,42 @@ def _get_chat_agent():
     return _SINGLETONS["chat_agent"]
 
 
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def _parse_string_list(value: Optional[Any]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except json.JSONDecodeError:
+                pass
+        return [item.strip() for item in text.split(",") if item.strip()]
+    return [str(value).strip()]
+
+
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
 
+
 class ChatResponse(BaseModel):
     answer: str
+
 
 class CandidateCreate(BaseModel):
     name: str
@@ -274,25 +319,44 @@ class CandidateCreate(BaseModel):
     job_title_applied: str = ""
     notes: str = ""
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be empty")
+        return value
+
+
 class CandidateUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
     score: Optional[float] = None
     stage: Optional[str] = None
-    skills: Optional[str] = None
+    skills: Optional[List[str] | str] = None
     experience_years: Optional[int] = None
     notes: Optional[str] = None
+    job_title_applied: Optional[str] = None
+    source: Optional[str] = None
+
+
+class CandidateAdvanceRequest(BaseModel):
+    stage: str
+    notes: str = ""
+    changed_by: str = "api"
+
 
 class ScoreRequest(BaseModel):
-    skills: List[str] = []
+    skills: List[str] = Field(default_factory=list)
     experience_years: int = 0
-    education: List[str] = []
+    education: List[str] = Field(default_factory=list)
     resume_text: str = ""
     job_title: str = ""
-    required_skills: List[str] = []
-    preferred_skills: List[str] = []
+    required_skills: List[str] = Field(default_factory=list)
+    preferred_skills: List[str] = Field(default_factory=list)
     min_experience: int = 2
+
 
 class ClassifyRequest(BaseModel):
     subject: str = ""
@@ -301,9 +365,49 @@ class ClassifyRequest(BaseModel):
     from_name: str = ""
     has_attachment: bool = False
 
+
 class TemplateRenderRequest(BaseModel):
     template_name: str
-    variables: Dict[str, str] = {}
+    variables: Dict[str, str] = Field(default_factory=dict)
+
+
+class WorkflowApplicationRequest(BaseModel):
+    subject: str = ""
+    body: str = ""
+    from_email: str = ""
+    from_name: str = ""
+    has_attachment: bool = False
+    attachment_path: Optional[str] = None
+    skills: List[str] = Field(default_factory=list)
+    experience_years: int = 0
+    education: List[str] = Field(default_factory=list)
+    job_title: str = ""
+    required_skills: List[str] = Field(default_factory=list)
+    preferred_skills: List[str] = Field(default_factory=list)
+    min_experience: int = 2
+    dry_run: bool = True
+
+
+class WorkflowScheduleRequest(BaseModel):
+    candidate_id: int
+    start_time: str
+    end_time: Optional[str] = None
+    position: str = ""
+    location: str = ""
+    interview_format: Optional[str] = None
+    send_invitation: bool = False
+    dry_run: bool = True
+
+
+class WorkflowRankingRequest(BaseModel):
+    stage: Optional[str] = None
+    limit: int = Field(default=50, ge=1, le=200)
+    auto_advance: bool = False
+    advance_threshold: float = 60.0
+    job_title: str = ""
+    required_skills: List[str] = Field(default_factory=list)
+    preferred_skills: List[str] = Field(default_factory=list)
+    min_experience: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +445,11 @@ def require_credentials():
 # ---------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 def root():
-    """Redirect browser users to the dashboard UI."""
     return RedirectResponse(url="/chat-ui")
 
 
 @app.get("/health", include_in_schema=False)
 def health():
-    """Health and usage info (machine-friendly)."""
     has_token = TOKEN_FILE.exists()
     return {
         "service": "Resume Agent API Server",
@@ -365,13 +467,15 @@ def health():
             "score": "POST /api/score",
             "classify": "POST /api/classify",
             "templates": "/api/templates",
+            "workflow_application": "POST /api/workflow/application",
+            "workflow_schedule": "POST /api/workflow/schedule",
+            "workflow_rank": "POST /api/workflow/rank",
         },
     }
 
 
 @app.get("/auth")
 def auth():
-    """Redirect user to Google OAuth consent screen."""
     if not CREDENTIALS_FILE.exists():
         raise HTTPException(
             status_code=500,
@@ -383,8 +487,6 @@ def auth():
 
     from google_auth_oauthlib.flow import Flow
 
-    # NOTE: Recent google-auth-oauthlib versions may use PKCE (code_challenge/code_verifier).
-    # We must keep the code_verifier generated during /auth and reuse it during /callback.
     flow = Flow.from_client_secrets_file(
         str(CREDENTIALS_FILE),
         scopes=SCOPES,
@@ -397,7 +499,6 @@ def auth():
         prompt="consent",
     )
 
-    # Cache PKCE verifier (best-effort).
     code_verifier = _get_flow_code_verifier(flow)
 
     if state:
@@ -416,7 +517,6 @@ def callback(
     state: Optional[str] = None,
     error: Optional[str] = None,
 ):
-    """Handle OAuth callback from Google."""
     if error:
         raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
     if not code:
@@ -424,19 +524,16 @@ def callback(
 
     from google_auth_oauthlib.flow import Flow
 
-    # Prefer the in-memory flow (keeps PKCE verifier automatically).
     flow = None
     if state:
         with _OAUTH_STATE_LOCK:
             flow = _OAUTH_FLOW_CACHE.pop(state, None)
 
-    # Fallback: recreate flow and re-attach PKCE code_verifier from disk cache.
     if flow is None:
         flow_kwargs: Dict[str, Any] = {
             "scopes": SCOPES,
             "redirect_uri": REDIRECT_URI,
         }
-        # `state` is passed through to requests-oauthlib/OAuth2Session.
         if state:
             flow_kwargs["state"] = state
 
@@ -461,22 +558,12 @@ def callback(
             )
 
         if code_verifier:
-            # Attach verifier where requests-oauthlib expects it.
-            try:
-                setattr(flow, "code_verifier", code_verifier)
-            except Exception:
-                pass
-            try:
-                flow.oauth2session._client.code_verifier = code_verifier
-            except Exception:
-                pass
+            _attach_code_verifier(flow, code_verifier)
 
-        # Remove used state from disk cache.
         if state and state in cache:
             cache.pop(state, None)
             _save_oauth_state_cache(cache)
 
-    # Exchange the authorization code for tokens.
     flow.fetch_token(code=code)
 
     creds = flow.credentials
@@ -500,11 +587,10 @@ def success():
 
 
 # ---------------------------------------------------------------------------
-# Calendar API (preserved from sample)
+# Calendar API
 # ---------------------------------------------------------------------------
 @app.get("/calendar/events")
-def calendar_events(max_results: int = 10):
-    """List upcoming events from the primary calendar."""
+def calendar_events(max_results: int = Query(default=10, ge=1, le=100)):
     creds = require_credentials()
     try:
         from googleapiclient.discovery import build
@@ -523,11 +609,10 @@ def calendar_events(max_results: int = 10):
 
 
 # ---------------------------------------------------------------------------
-# Gmail API (preserved from sample)
+# Gmail API
 # ---------------------------------------------------------------------------
 @app.get("/gmail/messages")
-def gmail_messages(max_results: int = 10):
-    """List recent messages from the inbox."""
+def gmail_messages(max_results: int = Query(default=10, ge=1, le=100)):
     creds = require_credentials()
     try:
         from googleapiclient.discovery import build
@@ -543,7 +628,6 @@ def gmail_messages(max_results: int = 10):
 
 @app.get("/gmail/messages/{message_id}")
 def gmail_message(message_id: str):
-    """Get one message by ID."""
     creds = require_credentials()
     try:
         from googleapiclient.discovery import build
@@ -564,11 +648,10 @@ def gmail_message(message_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Chat endpoint (enhanced)
+# Chat endpoint
 # ---------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest):
-    """Chat with the Coordinator Agent."""
     prompt = payload.message.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Field 'message' cannot be empty.")
@@ -583,7 +666,7 @@ async def chat(payload: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
-# Candidate API (new)
+# Candidate API
 # ---------------------------------------------------------------------------
 @app.get("/api/candidates")
 def list_candidates(
@@ -591,7 +674,6 @@ def list_candidates(
     search: Optional[str] = None,
     limit: int = Query(default=50, le=200),
 ):
-    """List candidates, optionally filtered by stage or search term."""
     db = _get_candidate_db()
     if search:
         candidates = db.search_candidates(query=search, limit=limit)
@@ -604,7 +686,6 @@ def list_candidates(
 
 @app.get("/api/candidates/{candidate_id}")
 def get_candidate(candidate_id: int):
-    """Get a single candidate by ID."""
     db = _get_candidate_db()
     candidate = db.get_candidate(candidate_id)
     if not candidate:
@@ -614,7 +695,6 @@ def get_candidate(candidate_id: int):
 
 @app.post("/api/candidates")
 def create_candidate(body: CandidateCreate):
-    """Create a new candidate."""
     db = _get_candidate_db()
     cid = db.create_candidate(
         name=body.name, email=body.email, phone=body.phone,
@@ -626,29 +706,59 @@ def create_candidate(body: CandidateCreate):
 
 @app.patch("/api/candidates/{candidate_id}")
 def update_candidate(candidate_id: int, body: CandidateUpdate):
-    """Update a candidate's fields."""
     db = _get_candidate_db()
-    updates = {k: v for k, v in body.dict().items() if v is not None}
-    if not updates:
+    if not db.get_candidate(candidate_id):
+        raise HTTPException(status_code=404, detail="Candidate not found.")
+
+    payload = {k: v for k, v in _model_dump(body).items() if v is not None}
+    requested_stage = payload.pop("stage", None)
+    if "skills" in payload:
+        payload["skills"] = _parse_string_list(payload["skills"])
+
+    updated = False
+    if payload:
+        updated = db.update_candidate(candidate_id=candidate_id, **payload)
+        if not updated:
+            raise HTTPException(status_code=400, detail="No supported fields to update.")
+
+    stage_result = None
+    if requested_stage:
+        try:
+            stage_result = db.advance_stage(candidate_id, requested_stage, changed_by="api")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not payload and stage_result is None:
         raise HTTPException(status_code=400, detail="No fields to update.")
-    db.update_candidate(candidate_id=candidate_id, **updates)
-    return {"message": "Candidate updated.", "candidate_id": candidate_id}
+
+    return {
+        "message": "Candidate updated.",
+        "candidate_id": candidate_id,
+        "updated_fields": sorted(payload.keys()),
+        "stage_transition": stage_result,
+    }
 
 
 @app.post("/api/candidates/{candidate_id}/advance")
-def advance_candidate(candidate_id: int, stage: str = Query(...)):
-    """Advance a candidate to a new pipeline stage."""
+def advance_candidate(candidate_id: int, body: CandidateAdvanceRequest):
     db = _get_candidate_db()
-    db.advance_stage(candidate_id, stage)
-    return {"message": f"Candidate advanced to {stage}.", "candidate_id": candidate_id}
+    try:
+        result = db.advance_stage(
+            candidate_id,
+            body.stage,
+            changed_by=body.changed_by,
+            notes=body.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": f"Candidate advanced to {body.stage}.", "candidate_id": candidate_id, "transition": result}
 
 
 # ---------------------------------------------------------------------------
-# Scoring API (new)
+# Scoring API
 # ---------------------------------------------------------------------------
 @app.post("/api/score")
 def score_candidate(body: ScoreRequest):
-    """Score a candidate against job requirements."""
     scorer = _get_scorer()
     req = JobRequirement(
         title=body.job_title or "Open Position",
@@ -656,22 +766,20 @@ def score_candidate(body: ScoreRequest):
         preferred_skills=body.preferred_skills,
         min_experience_years=body.min_experience,
     )
-    result = scorer.score_candidate(
+    return scorer.score_candidate(
         candidate_skills=body.skills,
         experience_years=body.experience_years,
         education_entries=body.education,
         resume_text=body.resume_text,
         requirements=req,
     )
-    return result
 
 
 # ---------------------------------------------------------------------------
-# Classification API (new)
+# Classification API
 # ---------------------------------------------------------------------------
 @app.post("/api/classify")
 def classify_email(body: ClassifyRequest):
-    """Classify an email into a recruitment category."""
     classifier = _get_classifier()
     result = classifier.classify(
         subject=body.subject, body=body.body,
@@ -682,52 +790,122 @@ def classify_email(body: ClassifyRequest):
 
 
 # ---------------------------------------------------------------------------
-# Template API (new)
+# Template API
 # ---------------------------------------------------------------------------
 @app.get("/api/templates")
 def list_templates():
-    """List available email templates."""
     engine = _get_template_engine()
-    templates = []
-    for name in engine.list_templates():
-        info = engine.get_template_info(name)
-        templates.append(info)
-    return {"templates": templates}
+    return {"templates": [engine.get_template_info(name) for name in engine.list_templates()]}
 
 
 @app.post("/api/templates/render")
 def render_template(body: TemplateRenderRequest):
-    """Render an email template with variables."""
     engine = _get_template_engine()
     try:
-        result = engine.render(body.template_name, body.variables)
-        return result
+        return engine.render(body.template_name, body.variables)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
-# Analytics API (new)
+# Workflow API
+# ---------------------------------------------------------------------------
+@app.post("/api/workflow/application")
+def workflow_application(body: WorkflowApplicationRequest):
+    req = JobRequirement(
+        title=body.job_title or "Open Position",
+        required_skills=body.required_skills,
+        preferred_skills=body.preferred_skills,
+        min_experience_years=body.min_experience,
+    )
+    workflow = NewApplicationWorkflow(
+        candidate_db=_get_candidate_db(),
+        classifier=_get_classifier(),
+        scorer=_get_scorer(),
+        template_engine=_get_template_engine(),
+        smtp_sender=_get_smtp_sender(),
+        knowledge_tool=_get_knowledge_tool(),
+        default_job_requirements=req,
+        auto_send_acknowledgment=not body.dry_run,
+    )
+    result = workflow.process(
+        subject=body.subject,
+        body=body.body,
+        from_email=body.from_email,
+        from_name=body.from_name,
+        has_attachment=body.has_attachment,
+        attachment_path=body.attachment_path,
+        skills=body.skills,
+        experience_years=body.experience_years,
+        education=body.education,
+        job_requirements=req,
+        dry_run=body.dry_run,
+    )
+    payload = result.to_dict()
+    payload["dry_run"] = body.dry_run
+    return payload
+
+
+@app.post("/api/workflow/schedule")
+def workflow_schedule(body: WorkflowScheduleRequest):
+    workflow = InterviewSchedulingWorkflow(
+        candidate_db=_get_candidate_db(),
+        calendar_service=_get_calendar_service(),
+        template_engine=_get_template_engine(),
+        smtp_sender=_get_smtp_sender(),
+    )
+    result = workflow.schedule(
+        candidate_id=body.candidate_id,
+        start_time=body.start_time,
+        end_time=body.end_time,
+        position=body.position,
+        location=body.location,
+        interview_format=body.interview_format,
+        send_invitation=body.send_invitation and not body.dry_run,
+        dry_run=body.dry_run,
+    )
+    payload = result.to_dict()
+    payload["dry_run"] = body.dry_run
+    return payload
+
+
+@app.post("/api/workflow/rank")
+def workflow_rank(body: WorkflowRankingRequest):
+    req = JobRequirement(
+        title=body.job_title or "Open Position",
+        required_skills=body.required_skills,
+        preferred_skills=body.preferred_skills,
+        min_experience_years=body.min_experience,
+    )
+    workflow = CandidateRankingWorkflow(
+        candidate_db=_get_candidate_db(),
+        scorer=_get_scorer(),
+        advance_threshold=body.advance_threshold,
+        auto_advance=body.auto_advance,
+    )
+    return workflow.rank_candidates(
+        stage=body.stage,
+        job_requirements=req,
+        limit=body.limit,
+    ).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Analytics API
 # ---------------------------------------------------------------------------
 @app.get("/api/analytics")
 def get_analytics():
-    """Get pipeline statistics."""
-    analytics = _get_analytics()
-    return analytics.pipeline_stats()
+    return _get_analytics().pipeline_stats()
 
 
 @app.get("/api/analytics/report")
 def get_full_report():
-    """Get comprehensive analytics report."""
-    analytics = _get_analytics()
-    return analytics.full_report()
+    return _get_analytics().full_report()
 
 
 @app.get("/api/analytics/top-candidates")
 def get_top_candidates(limit: int = Query(default=10, le=50)):
-    """Get top-scored candidates."""
-    analytics = _get_analytics()
-    return {"candidates": analytics.top_candidates(limit=limit)}
+    return {"candidates": _get_analytics().top_candidates(limit=limit)}
 
 
 # ---------------------------------------------------------------------------
@@ -735,337 +913,1200 @@ def get_top_candidates(limit: int = Query(default=10, le=50)):
 # ---------------------------------------------------------------------------
 @app.get("/chat-ui", response_class=HTMLResponse)
 def chat_ui():
-    """Enhanced browser UI with tabbed interface."""
     return HTMLResponse(content=_enhanced_chat_ui_html())
 
 
 def _enhanced_chat_ui_html() -> str:
     return """<!doctype html>
-<html lang="en">
+<html lang='en'>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Resume Agent — Enhanced Dashboard</title>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>Resume Agent Dashboard</title>
   <style>
     :root {
-      --bg: #0b1020;
-      --panel: #131a2e;
-      --panel-2: #1b2440;
-      --text: #edf2ff;
-      --muted: #9fb0d0;
-      --accent: #7aa2ff;
-      --accent-hover: #5d84de;
-      --user: #244a9a;
-      --agent: #223055;
-      --error: #9f2f2f;
-      --border: #2f3f69;
-      --success: #2e7d32;
-      --warning: #f57c00;
+      color-scheme: dark;
+      --bg: #07111f;
+      --bg-soft: #0b1728;
+      --panel: rgba(14, 24, 40, 0.88);
+      --panel-strong: #101b2f;
+      --panel-elevated: #14243e;
+      --border: rgba(148, 163, 184, 0.16);
+      --border-strong: rgba(96, 165, 250, 0.24);
+      --text: #e5eefc;
+      --muted: #94a3b8;
+      --subtle: #c9d7ee;
+      --brand: #6ea8fe;
+      --brand-strong: #4f8df7;
+      --accent: #22c55e;
+      --warning: #f59e0b;
+      --danger: #f87171;
+      --shadow: 0 24px 60px rgba(2, 8, 23, 0.45);
+      --radius-lg: 24px;
+      --radius-md: 18px;
+      --radius-sm: 12px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(1200px 500px at 20% -20%, #1f2b4d 0%, var(--bg) 50%);
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(14, 165, 233, 0.14), transparent 24%),
+        linear-gradient(180deg, #08111f 0%, #0a1424 45%, #08111d 100%);
       color: var(--text);
-      min-height: 100vh;
+      padding: 32px;
     }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 32px; }
-    .header { margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
-    .title { font-size: 22px; font-weight: 700; }
-    .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
-    .tabs { display: flex; gap: 2px; margin-bottom: 14px; }
-    .tab {
-      padding: 8px 18px; border-radius: 8px 8px 0 0; cursor: pointer;
-      background: var(--panel); color: var(--muted); border: 1px solid var(--border);
-      border-bottom: none; font-weight: 500; font-size: 14px; transition: all 0.2s;
+
+    .app-shell {
+      max-width: 1380px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
     }
-    .tab.active { background: var(--panel-2); color: var(--accent); border-color: var(--accent); }
-    .tab-content { display: none; }
-    .tab-content.active { display: block; }
-    .panel {
+
+    .sidebar,
+    .panel,
+    .hero {
+      backdrop-filter: blur(18px);
+      background: var(--panel);
       border: 1px solid var(--border);
-      background: linear-gradient(180deg, var(--panel), var(--panel-2));
-      border-radius: 0 14px 14px 14px; overflow: hidden;
-      box-shadow: 0 18px 40px rgba(0,0,0,0.3);
+      box-shadow: var(--shadow);
     }
-    #messages {
-      height: 55vh; overflow-y: auto; padding: 16px;
-      display: flex; flex-direction: column; gap: 10px;
+
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      padding: 24px;
+      border-radius: var(--radius-lg);
     }
-    .msg {
-      padding: 10px 14px; border-radius: 10px; white-space: pre-wrap;
-      line-height: 1.45; border: 1px solid rgba(255,255,255,0.08); font-size: 14px;
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 28px;
     }
-    .msg.user { align-self: flex-end; background: var(--user); max-width: 80%; }
-    .msg.agent { align-self: flex-start; background: var(--agent); max-width: 90%; }
-    .msg.error { align-self: flex-start; background: var(--error); max-width: 90%; }
-    .composer {
-      border-top: 1px solid var(--border); padding: 12px;
-      display: grid; grid-template-columns: 1fr auto; gap: 10px;
-      background: rgba(4,9,20,0.35);
+
+    .brand-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--brand), #8b5cf6);
+      display: grid;
+      place-items: center;
+      color: white;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      box-shadow: 0 12px 30px rgba(110, 168, 254, 0.32);
     }
-    textarea {
-      width: 100%; min-height: 60px; max-height: 160px; resize: vertical;
-      border-radius: 10px; border: 1px solid var(--border);
-      background: #0f1730; color: var(--text); padding: 10px; font: inherit; font-size: 14px;
+
+    .brand-title { font-size: 1rem; font-weight: 700; }
+    .brand-subtitle { color: var(--muted); font-size: 0.92rem; margin-top: 4px; }
+
+    .nav-group { margin-top: 24px; }
+    .nav-label {
+      color: var(--muted);
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 12px;
     }
-    button, .btn {
-      border: 1px solid var(--accent-hover); background: var(--accent); color: #0b1430;
-      border-radius: 8px; padding: 8px 16px; font-weight: 600; cursor: pointer;
-      font-size: 13px; transition: opacity 0.2s;
+
+    .nav-button {
+      width: 100%;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-radius: 14px;
+      cursor: pointer;
+      margin-bottom: 8px;
+      font-size: 0.95rem;
+      transition: 160ms ease;
     }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .quick { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-    .quick button {
-      background: transparent; color: var(--muted); border-color: var(--border);
-      padding: 6px 10px; min-width: 0; font-size: 12px;
+
+    .nav-button:hover,
+    .nav-button.active {
+      background: rgba(96, 165, 250, 0.12);
+      border-color: rgba(96, 165, 250, 0.2);
+      color: white;
     }
-    .quick button:hover { border-color: var(--accent); color: var(--accent); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
-    th { color: var(--accent); font-weight: 600; background: rgba(0,0,0,0.2); }
-    tr:hover { background: rgba(122,162,255,0.05); }
-    .badge {
-      display: inline-block; padding: 2px 8px; border-radius: 4px;
-      font-size: 11px; font-weight: 600;
+
+    .nav-button span:last-child {
+      color: var(--muted);
+      font-size: 0.78rem;
     }
-    .badge-new { background: #1a237e; color: #7aa2ff; }
-    .badge-screening { background: #0d47a1; color: #64b5f6; }
-    .badge-interview { background: #004d40; color: #4db6ac; }
-    .badge-ranked { background: #e65100; color: #ffb74d; }
-    .badge-offered { background: #1b5e20; color: #81c784; }
-    .badge-hired { background: var(--success); color: #c8e6c9; }
-    .badge-rejected { background: #b71c1c; color: #ef9a9a; }
-    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; padding: 16px; }
+
+    .sidebar-footer {
+      margin-top: 26px;
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+    }
+
+    .sidebar-footer strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.92rem;
+    }
+
+    .sidebar-footer p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.5;
+    }
+
+    .content {
+      display: grid;
+      gap: 20px;
+    }
+
+    .hero {
+      padding: 26px;
+      border-radius: var(--radius-lg);
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.8fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.82rem;
+      color: #bfdbfe;
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(96, 165, 250, 0.18);
+      border-radius: 999px;
+      padding: 8px 12px;
+      margin-bottom: 16px;
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(2rem, 3vw, 3rem);
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+
+    .hero p {
+      margin: 14px 0 0;
+      color: var(--muted);
+      max-width: 720px;
+      line-height: 1.7;
+      font-size: 1rem;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    .btn,
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
+
+    .btn,
+    button {
+      border: none;
+      border-radius: 14px;
+      padding: 12px 16px;
+      cursor: pointer;
+      transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+
+    .btn-primary,
+    button.btn-primary {
+      background: linear-gradient(135deg, var(--brand), var(--brand-strong));
+      color: #061120;
+      font-weight: 700;
+      box-shadow: 0 16px 34px rgba(59, 130, 246, 0.32);
+    }
+
+    .btn-secondary,
+    button.btn-secondary {
+      background: rgba(148, 163, 184, 0.1);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      color: var(--text);
+    }
+
+    .btn:hover,
+    button:hover { transform: translateY(-1px); }
+    .btn:disabled,
+    button:disabled {
+      opacity: 0.65;
+      cursor: wait;
+      transform: none;
+    }
+
+    .hero-side {
+      background: linear-gradient(180deg, rgba(17, 27, 46, 0.88), rgba(12, 19, 33, 0.92));
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 20px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .mini-metric {
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(96, 165, 250, 0.08);
+      border: 1px solid rgba(96, 165, 250, 0.12);
+    }
+
+    .mini-metric-label { color: var(--muted); font-size: 0.83rem; }
+    .mini-metric-value { font-size: 1.5rem; font-weight: 800; margin-top: 4px; }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .stat-card,
+    .panel {
+      border-radius: 22px;
+    }
+
     .stat-card {
-      background: rgba(0,0,0,0.2); border: 1px solid var(--border);
-      border-radius: 10px; padding: 16px; text-align: center;
+      padding: 18px;
+      background: linear-gradient(180deg, rgba(17, 27, 46, 0.88), rgba(12, 19, 33, 0.92));
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
     }
-    .stat-value { font-size: 28px; font-weight: 700; color: var(--accent); }
-    .stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
-    .pipeline-content, .analytics-content { padding: 16px; min-height: 400px; }
-    .toolbar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
-    .toolbar select, .toolbar input {
-      background: #0f1730; color: var(--text); border: 1px solid var(--border);
-      border-radius: 6px; padding: 6px 10px; font-size: 13px;
+
+    .stat-label { color: var(--muted); font-size: 0.84rem; }
+    .stat-value { font-size: 1.9rem; font-weight: 800; margin-top: 8px; }
+    .stat-footnote { color: var(--muted); font-size: 0.84rem; margin-top: 8px; }
+
+    .panel {
+      padding: 22px;
     }
-    .loading { text-align: center; padding: 40px; color: var(--muted); }
+
+    .panel-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .panel-title h2,
+    .panel-title h3 {
+      margin: 0;
+      font-size: 1.15rem;
+      letter-spacing: -0.02em;
+    }
+
+    .panel-title p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .panel-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+    }
+
+    .field-row,
+    .search-row {
+      display: grid;
+      gap: 12px;
+    }
+
+    .field-row.two,
+    .search-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--subtle);
+      font-size: 0.87rem;
+      font-weight: 600;
+    }
+
+    input,
+    textarea,
+    select {
+      width: 100%;
+      background: rgba(8, 15, 28, 0.78);
+      color: var(--text);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      border-radius: 14px;
+      padding: 13px 14px;
+      outline: none;
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+
+    textarea { min-height: 150px; resize: vertical; line-height: 1.6; }
+    input::placeholder,
+    textarea::placeholder { color: #64748b; }
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 4px rgba(110, 168, 254, 0.12);
+      background: rgba(10, 18, 33, 0.92);
+    }
+
+    .chat-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 18px;
+    }
+
+    .chat-log {
+      min-height: 420px;
+      max-height: 620px;
+      overflow: auto;
+      display: grid;
+      gap: 14px;
+      padding-right: 4px;
+    }
+
+    .message {
+      border-radius: 18px;
+      padding: 16px 18px;
+      border: 1px solid var(--border);
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(8, 15, 28, 0.76);
+    }
+
+    .message.user {
+      background: linear-gradient(180deg, rgba(59, 130, 246, 0.16), rgba(59, 130, 246, 0.09));
+      border-color: rgba(96, 165, 250, 0.22);
+    }
+
+    .message.agent {
+      background: rgba(15, 23, 42, 0.74);
+    }
+
+    .message-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .aside-card {
+      padding: 18px;
+      border-radius: 18px;
+      background: rgba(8, 15, 28, 0.65);
+      border: 1px solid var(--border);
+      margin-bottom: 14px;
+    }
+
+    .aside-card h4 {
+      margin: 0 0 10px;
+      font-size: 0.96rem;
+    }
+
+    .aside-card p,
+    .aside-card li {
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.9rem;
+    }
+
+    .chip-row,
+    .filter-row,
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: rgba(148, 163, 184, 0.08);
+      border: 1px solid rgba(148, 163, 184, 0.1);
+      color: var(--subtle);
+      font-size: 0.86rem;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(8, 15, 28, 0.55);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 780px;
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      text-align: left;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 0.79rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: rgba(15, 23, 42, 0.8);
+      position: sticky;
+      top: 0;
+    }
+
+    tr:hover td {
+      background: rgba(96, 165, 250, 0.04);
+    }
+
+    .stage-pill,
+    .score-pill,
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 30px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+    }
+
+    .stage-pill { background: rgba(96, 165, 250, 0.12); color: #bfdbfe; }
+    .score-pill.high { background: rgba(34, 197, 94, 0.14); color: #86efac; }
+    .score-pill.medium { background: rgba(245, 158, 11, 0.14); color: #fcd34d; }
+    .score-pill.low { background: rgba(248, 113, 113, 0.14); color: #fca5a5; }
+
+    .analytics-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 18px;
+    }
+
+    .stack { display: grid; gap: 14px; }
+
+    .bar-list { display: grid; gap: 12px; }
+    .bar-item { display: grid; gap: 8px; }
+    .bar-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--subtle);
+      font-size: 0.9rem;
+    }
+
+    .bar-track {
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(148, 163, 184, 0.12);
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--brand), #8b5cf6);
+    }
+
+    .empty-state,
+    .loading-state,
+    .error-state {
+      padding: 26px;
+      border: 1px dashed rgba(148, 163, 184, 0.18);
+      border-radius: 18px;
+      text-align: center;
+      color: var(--muted);
+      background: rgba(8, 15, 28, 0.45);
+    }
+
+    .loading-state::before {
+      content: '';
+      display: block;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      margin: 0 auto 14px;
+      border: 3px solid rgba(148, 163, 184, 0.18);
+      border-top-color: var(--brand);
+      animation: spin 0.9s linear infinite;
+    }
+
+    .error-state {
+      border-style: solid;
+      border-color: rgba(248, 113, 113, 0.22);
+      color: #fecaca;
+      background: rgba(127, 29, 29, 0.16);
+    }
+
+    .raw-output {
+      margin-top: 16px;
+      padding: 16px;
+      border-radius: 16px;
+      background: rgba(8, 15, 28, 0.7);
+      border: 1px solid var(--border);
+      max-height: 320px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #cbd5e1;
+      font-size: 0.85rem;
+      line-height: 1.6;
+    }
+
+    .hidden { display: none !important; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (max-width: 1180px) {
+      .app-shell,
+      .hero,
+      .panel-grid,
+      .chat-layout,
+      .analytics-grid,
+      .summary-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+      }
+    }
+
+    @media (max-width: 720px) {
+      body { padding: 18px; }
+      .sidebar, .panel, .hero, .stat-card { border-radius: 18px; }
+      .field-row.two, .search-row { grid-template-columns: 1fr; }
+      .hero-actions, .filter-row, .action-row { flex-direction: column; align-items: stretch; }
+      table { min-width: 640px; }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="header">
-      <div>
-        <h1 class="title">Resume Agent Dashboard</h1>
-        <p class="subtitle">Multi-agent recruitment pipeline — Chat, Pipeline, Analytics</p>
+  <div class='app-shell'>
+    <aside class='sidebar'>
+      <div class='brand'>
+        <div class='brand-mark'>RA</div>
+        <div>
+          <div class='brand-title'>Resume Agent</div>
+          <div class='brand-subtitle'>Recruiting operations cockpit</div>
+        </div>
       </div>
-    </div>
 
-    <div class="tabs">
-      <div class="tab active" data-tab="chat">Chat</div>
-      <div class="tab" data-tab="pipeline">Pipeline</div>
-      <div class="tab" data-tab="analytics">Analytics</div>
-    </div>
-
-    <!-- Chat Tab -->
-    <div class="tab-content active" id="tab-chat">
-      <div class="quick">
-        <button data-prompt="Show latest 5 unread emails">Unread Emails</button>
-        <button data-prompt="Show all candidates in the pipeline">All Candidates</button>
-        <button data-prompt="Rank all candidates in SCREENING stage">Rank Candidates</button>
-        <button data-prompt="Show pipeline analytics report">Analytics Report</button>
-        <button data-prompt="What are the top 5 candidates by score?">Top Candidates</button>
-        <button data-prompt="Search knowledge base for python developer resumes">Search Resumes</button>
+      <div class='nav-group'>
+        <div class='nav-label'>Workspace</div>
+        <button class='nav-button active' data-tab-target='chatTab'>
+          <span>AI recruiter chat</span><span>Live</span>
+        </button>
+        <button class='nav-button' data-tab-target='pipelineTab'>
+          <span>Candidate pipeline</span><span>Board</span>
+        </button>
+        <button class='nav-button' data-tab-target='analyticsTab'>
+          <span>Analytics overview</span><span>Insights</span>
+        </button>
       </div>
-      <div class="panel">
-        <div id="messages"></div>
-        <form id="chat-form" class="composer">
-          <textarea id="prompt" placeholder="Ask the Coordinator Agent anything..."></textarea>
-          <button id="send-btn" type="submit">Send</button>
-        </form>
-      </div>
-    </div>
 
-    <!-- Pipeline Tab -->
-    <div class="tab-content" id="tab-pipeline">
-      <div class="panel">
-        <div class="pipeline-content">
-          <div class="toolbar">
-            <select id="stage-filter">
-              <option value="">All Stages</option>
-              <option value="NEW">NEW</option>
-              <option value="SCREENING">SCREENING</option>
-              <option value="INTERVIEW_SCHEDULED">INTERVIEW_SCHEDULED</option>
-              <option value="INTERVIEWED">INTERVIEWED</option>
-              <option value="RANKED">RANKED</option>
-              <option value="OFFERED">OFFERED</option>
-              <option value="HIRED">HIRED</option>
-              <option value="REJECTED">REJECTED</option>
-            </select>
-            <input type="text" id="search-input" placeholder="Search candidates..." />
-            <button onclick="loadCandidates()">Refresh</button>
+      <div class='nav-group'>
+        <div class='nav-label'>Quick actions</div>
+        <div class='chip-row'>
+          <span class='chip'>/chat</span>
+          <span class='chip'>/api/candidates</span>
+          <span class='chip'>/api/analytics/report</span>
+        </div>
+      </div>
+
+      <div class='sidebar-footer'>
+        <strong>What changed</strong>
+        <p>Cleaner information hierarchy, visual metrics, real content sections, and friendlier loading and empty states without changing your backend routes.</p>
+      </div>
+    </aside>
+
+    <main class='content'>
+      <section class='hero'>
+        <div>
+          <div class='eyebrow'>Modern recruiting workspace</div>
+          <h1>Run chat, pipeline, and analytics from one polished dashboard.</h1>
+          <p>Use the agent for recruiting tasks, inspect the candidate funnel, and review performance trends in a UI that feels closer to a modern SaaS product than a raw API console.</p>
+          <div class='hero-actions'>
+            <button class='btn btn-primary' type='button' onclick='focusPrompt()'>Start with chat</button>
+            <button class='btn btn-secondary' type='button' onclick='refreshAll()'>Refresh all data</button>
           </div>
-          <div id="candidates-table"><div class="loading">Loading candidates...</div></div>
         </div>
-      </div>
-    </div>
 
-    <!-- Analytics Tab -->
-    <div class="tab-content" id="tab-analytics">
-      <div class="panel">
-        <div class="analytics-content">
-          <div id="analytics-stats"><div class="loading">Loading analytics...</div></div>
-          <div id="analytics-details" style="margin-top:16px;"></div>
+        <div class='hero-side'>
+          <div class='mini-metric'>
+            <div class='mini-metric-label'>System status</div>
+            <div class='mini-metric-value' id='systemStatus'>Ready</div>
+          </div>
+          <div class='mini-metric'>
+            <div class='mini-metric-label'>Candidates loaded</div>
+            <div class='mini-metric-value' id='candidateCount'>—</div>
+          </div>
+          <div class='mini-metric'>
+            <div class='mini-metric-label'>Top funnel stage</div>
+            <div class='mini-metric-value' id='topStage'>—</div>
+          </div>
         </div>
-      </div>
-    </div>
+      </section>
+
+      <section class='summary-grid'>
+        <div class='stat-card'>
+          <div class='stat-label'>Total candidates</div>
+          <div class='stat-value' id='statCandidates'>—</div>
+          <div class='stat-footnote'>Updated from the candidate API</div>
+        </div>
+        <div class='stat-card'>
+          <div class='stat-label'>Average score</div>
+          <div class='stat-value' id='statAverageScore'>—</div>
+          <div class='stat-footnote'>Across currently loaded candidates</div>
+        </div>
+        <div class='stat-card'>
+          <div class='stat-label'>Active stages</div>
+          <div class='stat-value' id='statStages'>—</div>
+          <div class='stat-footnote'>Distinct stages in the current view</div>
+        </div>
+        <div class='stat-card'>
+          <div class='stat-label'>Last refresh</div>
+          <div class='stat-value' id='statRefresh'>Never</div>
+          <div class='stat-footnote'>Keeps the dashboard grounded in live data</div>
+        </div>
+      </section>
+
+      <section class='panel'>
+        <div class='panel-header'>
+          <div class='panel-title'>
+            <h2>Operations workspace</h2>
+            <p>Switch between agent chat, candidate pipeline, and analytics without losing context.</p>
+          </div>
+          <div class='chip-row'>
+            <span class='chip'>Single-file UI</span>
+            <span class='chip'>No backend contract changes</span>
+            <span class='chip'>FastAPI compatible</span>
+          </div>
+        </div>
+
+        <div id='chatTab' class='tab-panel active'>
+          <div class='chat-layout'>
+            <div>
+              <div class='field-row'>
+                <div>
+                  <label for='prompt'>Ask the agent</label>
+                  <textarea id='prompt' placeholder='Example: Summarize the strongest backend candidates and suggest who should move to interview.'></textarea>
+                </div>
+              </div>
+              <div class='action-row' style='margin-top: 14px;'>
+                <button id='sendChatButton' class='btn btn-primary' type='button' onclick='sendChat()'>Send message</button>
+                <button class='btn btn-secondary' type='button' onclick='usePromptExample(`Find the top three candidates for a senior ML role and explain why.`)'>Use example prompt</button>
+                <button class='btn btn-secondary' type='button' onclick='clearChat()'>Clear conversation</button>
+              </div>
+              <div class='panel' style='padding:18px; margin-top:18px; background: rgba(8, 15, 28, 0.38); border:1px solid var(--border);'>
+                <div class='panel-header' style='margin-bottom:12px;'>
+                  <div class='panel-title'>
+                    <h3>Conversation feed</h3>
+                    <p>Responses render as chat bubbles instead of raw JSON blocks.</p>
+                  </div>
+                </div>
+                <div id='chatLog' class='chat-log'></div>
+              </div>
+            </div>
+
+            <div>
+              <div class='aside-card'>
+                <h4>Recommended prompts</h4>
+                <ul>
+                  <li>Who should we prioritize for screening this week?</li>
+                  <li>Draft an interview plan for shortlisted candidates.</li>
+                  <li>Summarize the pipeline risk areas and bottlenecks.</li>
+                </ul>
+              </div>
+              <div class='aside-card'>
+                <h4>Chat status</h4>
+                <p id='chatStatus'>Ready for your first prompt.</p>
+              </div>
+              <div class='aside-card'>
+                <h4>Raw API response</h4>
+                <div id='chatRaw' class='raw-output'>No response yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id='pipelineTab' class='tab-panel'>
+          <div class='panel-grid'>
+            <div>
+              <div class='panel-header'>
+                <div class='panel-title'>
+                  <h3>Candidate pipeline</h3>
+                  <p>Filter by stage and inspect the current hiring funnel in a readable table.</p>
+                </div>
+              </div>
+              <div class='search-row'>
+                <div>
+                  <label for='stage'>Stage filter</label>
+                  <input id='stage' placeholder='Optional stage filter, e.g. SCREENING' />
+                </div>
+                <div>
+                  <label for='candidateLimit'>Limit</label>
+                  <select id='candidateLimit'>
+                    <option value='25'>25</option>
+                    <option value='50' selected>50</option>
+                    <option value='100'>100</option>
+                    <option value='200'>200</option>
+                  </select>
+                </div>
+              </div>
+              <div class='action-row' style='margin-top:14px;'>
+                <button id='loadCandidatesButton' class='btn btn-primary' type='button' onclick='loadCandidates()'>Load candidates</button>
+                <button class='btn btn-secondary' type='button' onclick='clearStageFilter()'>Clear filter</button>
+              </div>
+              <div id='pipelineContent' style='margin-top:18px;'></div>
+            </div>
+
+            <div class='stack'>
+              <div class='aside-card'>
+                <h4>Pipeline summary</h4>
+                <div id='pipelineSummary' class='bar-list'></div>
+              </div>
+              <div class='aside-card'>
+                <h4>Current view notes</h4>
+                <p id='pipelineStatus'>Load candidates to see stage distribution, top scores, and candidate details.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id='analyticsTab' class='tab-panel'>
+          <div class='panel-header'>
+            <div class='panel-title'>
+              <h3>Analytics overview</h3>
+              <p>Turn the analytics report into digestible metrics, top-stage distribution, and a readable JSON fallback.</p>
+            </div>
+            <button id='loadAnalyticsButton' class='btn btn-primary' type='button' onclick='loadAnalytics()'>Refresh analytics</button>
+          </div>
+          <div class='analytics-grid'>
+            <div class='stack'>
+              <div class='aside-card'>
+                <h4>Stage distribution</h4>
+                <div id='analyticsBars' class='bar-list'></div>
+              </div>
+              <div class='aside-card'>
+                <h4>Highlights</h4>
+                <div id='analyticsHighlights' class='chip-row'></div>
+              </div>
+            </div>
+            <div class='stack'>
+              <div class='aside-card'>
+                <h4>Report payload</h4>
+                <div id='analyticsRaw' class='raw-output'>No analytics loaded yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <script>
-    // Tab switching
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-        tab.classList.add('active');
-        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-        if (tab.dataset.tab === 'pipeline') loadCandidates();
-        if (tab.dataset.tab === 'analytics') loadAnalytics();
+    const state = {
+      chatHistory: [],
+      candidates: [],
+      analytics: null,
+    };
+
+    function setActiveTab(tabId) {
+      document.querySelectorAll('.tab-panel').forEach((panel) => {
+        panel.classList.toggle('active', panel.id === tabId);
       });
-    });
-
-    // Chat
-    const messages = document.getElementById("messages");
-    const form = document.getElementById("chat-form");
-    const input = document.getElementById("prompt");
-    const sendBtn = document.getElementById("send-btn");
-
-    function pushMessage(kind, text) {
-      const div = document.createElement("div");
-      div.className = "msg " + kind;
-      div.textContent = text;
-      messages.appendChild(div);
-      messages.scrollTop = messages.scrollHeight;
+      document.querySelectorAll('.nav-button').forEach((button) => {
+        button.classList.toggle('active', button.dataset.tabTarget === tabId);
+      });
     }
 
-    async function sendPrompt(prompt) {
-      const clean = prompt.trim();
-      if (!clean) return;
-      pushMessage("user", clean);
-      sendBtn.disabled = true;
+    document.querySelectorAll('[data-tab-target]').forEach((button) => {
+      button.addEventListener('click', () => setActiveTab(button.dataset.tabTarget));
+    });
+
+    function focusPrompt() {
+      setActiveTab('chatTab');
+      const prompt = document.getElementById('prompt');
+      prompt.focus();
+      prompt.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function usePromptExample(text) {
+      setActiveTab('chatTab');
+      const prompt = document.getElementById('prompt');
+      prompt.value = text;
+      prompt.focus();
+    }
+
+    function clearChat() {
+      state.chatHistory = [];
+      renderChatLog();
+      document.getElementById('chatRaw').textContent = 'No response yet.';
+      document.getElementById('chatStatus').textContent = 'Conversation cleared.';
+    }
+
+    function setSystemStatus(text) {
+      document.getElementById('systemStatus').textContent = text;
+    }
+
+    function formatTimestamp(date = new Date()) {
+      return new Intl.DateTimeFormat([], {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit'
+      }).format(date);
+    }
+
+    function updateRefreshStamp() {
+      document.getElementById('statRefresh').textContent = formatTimestamp();
+    }
+
+    function renderChatLog() {
+      const chatLog = document.getElementById('chatLog');
+      if (!state.chatHistory.length) {
+        chatLog.innerHTML = "<div class='empty-state'>Start a conversation with the recruiting agent. Replies will appear here as a readable timeline.</div>";
+        return;
+      }
+
+      chatLog.innerHTML = state.chatHistory.map((item) => `
+        <div class='message ${item.role}'>
+          <div class='message-meta'>
+            <span>${item.role === 'user' ? 'You' : 'Resume Agent'}</span>
+            <span>${item.time}</span>
+          </div>
+          <div>${escapeHtml(item.text)}</div>
+        </div>
+      `).join('');
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, options);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = data.detail || data.message || `Request failed with status ${response.status}`;
+        throw new Error(message);
+      }
+      return data;
+    }
+
+    async function sendChat() {
+      const promptEl = document.getElementById('prompt');
+      const prompt = promptEl.value.trim();
+      if (!prompt) {
+        document.getElementById('chatStatus').textContent = 'Enter a message to start the conversation.';
+        promptEl.focus();
+        return;
+      }
+
+      const sendButton = document.getElementById('sendChatButton');
+      sendButton.disabled = true;
+      setSystemStatus('Thinking…');
+      document.getElementById('chatStatus').textContent = 'Contacting the agent…';
+
+      state.chatHistory.push({ role: 'user', text: prompt, time: formatTimestamp() });
+      renderChatLog();
+
       try {
-        const res = await fetch("/chat", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({message: clean})
+        const data = await fetchJson('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: prompt })
         });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.detail || "Request failed");
-        pushMessage("agent", body.answer || "(empty response)");
-      } catch (err) {
-        pushMessage("error", "Error: " + err.message);
+
+        state.chatHistory.push({ role: 'agent', text: data.answer || '(empty response)', time: formatTimestamp() });
+        document.getElementById('chatRaw').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('chatStatus').textContent = 'Reply received.';
+        promptEl.value = '';
+      } catch (error) {
+        state.chatHistory.push({ role: 'agent', text: `Error: ${error.message}`, time: formatTimestamp() });
+        document.getElementById('chatRaw').textContent = error.message;
+        document.getElementById('chatStatus').textContent = 'Chat request failed.';
       } finally {
-        sendBtn.disabled = false;
+        sendButton.disabled = false;
+        setSystemStatus('Ready');
+        renderChatLog();
+        updateRefreshStamp();
       }
     }
 
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const value = input.value;
-      input.value = "";
-      await sendPrompt(value);
-      input.focus();
-    });
+    function scoreClass(score) {
+      const numeric = Number(score);
+      if (!Number.isFinite(numeric)) return 'low';
+      if (numeric >= 75) return 'high';
+      if (numeric >= 50) return 'medium';
+      return 'low';
+    }
 
-    document.querySelectorAll(".quick button").forEach(btn => {
-      btn.addEventListener("click", () => sendPrompt(btn.dataset.prompt || ""));
-    });
+    function summarizeCandidates(candidates) {
+      const count = candidates.length;
+      const scores = candidates.map((candidate) => Number(candidate.score)).filter(Number.isFinite);
+      const avgScore = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+      const stages = {};
+      candidates.forEach((candidate) => {
+        const stage = candidate.stage || 'UNKNOWN';
+        stages[stage] = (stages[stage] || 0) + 1;
+      });
+      const topStageEntry = Object.entries(stages).sort((a, b) => b[1] - a[1])[0];
+      return { count, avgScore, stages, topStageEntry };
+    }
 
-    pushMessage("agent", "Ready. I'm the Coordinator Agent with access to all recruitment tools. Try a quick prompt above or ask me anything.");
+    function renderPipeline(candidates) {
+      const content = document.getElementById('pipelineContent');
+      const summary = document.getElementById('pipelineSummary');
+      const status = document.getElementById('pipelineStatus');
 
-    // Pipeline
-    function stageBadge(stage) {
-      const cls = {
-        'NEW': 'badge-new', 'SCREENING': 'badge-screening',
-        'INTERVIEW_SCHEDULED': 'badge-interview', 'INTERVIEWED': 'badge-interview',
-        'RANKED': 'badge-ranked', 'OFFERED': 'badge-offered',
-        'HIRED': 'badge-hired', 'REJECTED': 'badge-rejected'
-      }[stage] || 'badge-new';
-      return '<span class="badge ' + cls + '">' + stage + '</span>';
+      if (!candidates.length) {
+        content.innerHTML = "<div class='empty-state'>No candidates matched this filter. Try another stage or remove the filter.</div>";
+        summary.innerHTML = "<div class='empty-state'>Stage distribution will appear here once candidates are loaded.</div>";
+        status.textContent = 'No candidates found in the current view.';
+        document.getElementById('candidateCount').textContent = '0';
+        document.getElementById('topStage').textContent = '—';
+        document.getElementById('statCandidates').textContent = '0';
+        document.getElementById('statAverageScore').textContent = '—';
+        document.getElementById('statStages').textContent = '0';
+        return;
+      }
+
+      const stats = summarizeCandidates(candidates);
+      const maxStageCount = Math.max(...Object.values(stats.stages));
+
+      summary.innerHTML = Object.entries(stats.stages)
+        .sort((a, b) => b[1] - a[1])
+        .map(([stage, count]) => `
+          <div class='bar-item'>
+            <div class='bar-meta'><span>${escapeHtml(stage)}</span><span>${count}</span></div>
+            <div class='bar-track'><div class='bar-fill' style='width:${(count / maxStageCount) * 100}%;'></div></div>
+          </div>
+        `).join('');
+
+      content.innerHTML = `
+        <div class='table-wrap'>
+          <table>
+            <thead>
+              <tr>
+                <th>Candidate</th>
+                <th>Stage</th>
+                <th>Score</th>
+                <th>Role</th>
+                <th>Source</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${candidates.map((candidate) => `
+                <tr>
+                  <td>
+                    <strong>${escapeHtml(candidate.name || 'Unnamed')}</strong><br />
+                    <span style='color: var(--muted);'>${escapeHtml(candidate.email || 'No email')}</span>
+                  </td>
+                  <td><span class='stage-pill'>${escapeHtml(candidate.stage || 'UNKNOWN')}</span></td>
+                  <td><span class='score-pill ${scoreClass(candidate.score)}'>${candidate.score ?? '—'}</span></td>
+                  <td>${escapeHtml(candidate.job_title_applied || '—')}</td>
+                  <td>${escapeHtml(candidate.source || '—')}</td>
+                  <td>${escapeHtml(candidate.notes || '—').slice(0, 180)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `;
+
+      status.textContent = `${stats.count} candidates loaded. ${stats.topStageEntry ? `${stats.topStageEntry[0]} is currently the largest stage.` : 'Stage mix unavailable.'}`;
+      document.getElementById('candidateCount').textContent = String(stats.count);
+      document.getElementById('topStage').textContent = stats.topStageEntry ? stats.topStageEntry[0] : '—';
+      document.getElementById('statCandidates').textContent = String(stats.count);
+      document.getElementById('statAverageScore').textContent = stats.avgScore !== null ? `${stats.avgScore}` : '—';
+      document.getElementById('statStages').textContent = String(Object.keys(stats.stages).length);
     }
 
     async function loadCandidates() {
-      const stage = document.getElementById('stage-filter').value;
-      const search = document.getElementById('search-input').value;
-      let url = '/api/candidates?limit=50';
-      if (stage) url += '&stage=' + stage;
-      if (search) url += '&search=' + encodeURIComponent(search);
+      const stage = document.getElementById('stage').value.trim();
+      const limit = document.getElementById('candidateLimit').value;
+      const loadButton = document.getElementById('loadCandidatesButton');
+      const content = document.getElementById('pipelineContent');
+
+      setActiveTab('pipelineTab');
+      loadButton.disabled = true;
+      setSystemStatus('Loading pipeline…');
+      content.innerHTML = "<div class='loading-state'>Fetching candidates from the pipeline API…</div>";
+
       try {
-        const res = await fetch(url);
-        const data = await res.json();
-        const candidates = data.candidates || [];
-        if (!candidates.length) {
-          document.getElementById('candidates-table').innerHTML = '<div class="loading">No candidates found.</div>';
-          return;
-        }
-        let html = '<table><thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Stage</th><th>Score</th><th>Source</th><th>Applied For</th></tr></thead><tbody>';
-        candidates.forEach(c => {
-          html += '<tr><td>' + c.id + '</td><td>' + (c.name||'') + '</td><td>' + (c.email||'') +
-            '</td><td>' + stageBadge(c.stage) + '</td><td>' + (c.score||0).toFixed(1) +
-            '</td><td>' + (c.source||'') + '</td><td>' + (c.job_title_applied||'') + '</td></tr>';
-        });
-        html += '</tbody></table>';
-        document.getElementById('candidates-table').innerHTML = html;
-      } catch (err) {
-        document.getElementById('candidates-table').innerHTML = '<div class="loading">Error: ' + err.message + '</div>';
+        const query = new URLSearchParams();
+        if (stage) query.set('stage', stage);
+        if (limit) query.set('limit', limit);
+        const data = await fetchJson(`/api/candidates?${query.toString()}`);
+        state.candidates = Array.isArray(data.candidates) ? data.candidates : [];
+        renderPipeline(state.candidates);
+      } catch (error) {
+        content.innerHTML = `<div class='error-state'>${escapeHtml(error.message)}</div>`;
+        document.getElementById('pipelineSummary').innerHTML = `<div class='error-state'>Unable to compute stage summary.</div>`;
+        document.getElementById('pipelineStatus').textContent = 'Pipeline request failed.';
+      } finally {
+        loadButton.disabled = false;
+        setSystemStatus('Ready');
+        updateRefreshStamp();
       }
     }
 
-    document.getElementById('stage-filter').addEventListener('change', loadCandidates);
-    document.getElementById('search-input').addEventListener('keyup', (e) => { if (e.key === 'Enter') loadCandidates(); });
+    function clearStageFilter() {
+      document.getElementById('stage').value = '';
+      loadCandidates();
+    }
 
-    // Analytics
+    function findStageBreakdown(payload) {
+      if (!payload || typeof payload !== 'object') return [];
+      const candidates = [];
+      for (const [key, value] of Object.entries(payload)) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const normalized = Object.entries(value)
+            .filter(([, count]) => typeof count === 'number')
+            .map(([label, count]) => ({ label, count, source: key }));
+          if (normalized.length >= 2) {
+            return normalized;
+          }
+        }
+      }
+      return candidates;
+    }
+
+    function collectNumericHighlights(payload, prefix = '') {
+      const results = [];
+      if (!payload || typeof payload !== 'object') return results;
+      for (const [key, value] of Object.entries(payload)) {
+        const label = prefix ? `${prefix}.${key}` : key;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          results.push({ label, value });
+        } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+          results.push(...collectNumericHighlights(value, label));
+        }
+      }
+      return results;
+    }
+
+    function renderAnalytics(report) {
+      const bars = document.getElementById('analyticsBars');
+      const highlights = document.getElementById('analyticsHighlights');
+      const raw = document.getElementById('analyticsRaw');
+      raw.textContent = JSON.stringify(report, null, 2);
+
+      const stageBreakdown = findStageBreakdown(report);
+      if (stageBreakdown.length) {
+        const maxCount = Math.max(...stageBreakdown.map((item) => item.count));
+        bars.innerHTML = stageBreakdown
+          .sort((a, b) => b.count - a.count)
+          .map((item) => `
+            <div class='bar-item'>
+              <div class='bar-meta'><span>${escapeHtml(item.label)}</span><span>${item.count}</span></div>
+              <div class='bar-track'><div class='bar-fill' style='width:${(item.count / maxCount) * 100}%;'></div></div>
+            </div>
+          `).join('');
+      } else {
+        bars.innerHTML = "<div class='empty-state'>No stage breakdown was found in the analytics payload, so the raw report is shown on the right.</div>";
+      }
+
+      const numericHighlights = collectNumericHighlights(report)
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 8);
+      if (numericHighlights.length) {
+        highlights.innerHTML = numericHighlights
+          .map((item) => `<span class='chip'>${escapeHtml(item.label)}: ${item.value}</span>`)
+          .join('');
+      } else {
+        highlights.innerHTML = "<div class='empty-state'>No numeric highlights found in the analytics report.</div>";
+      }
+    }
+
     async function loadAnalytics() {
+      const button = document.getElementById('loadAnalyticsButton');
+      const bars = document.getElementById('analyticsBars');
+      const highlights = document.getElementById('analyticsHighlights');
+      setActiveTab('analyticsTab');
+      button.disabled = true;
+      setSystemStatus('Loading analytics…');
+      bars.innerHTML = "<div class='loading-state'>Building analytics overview…</div>";
+      highlights.innerHTML = '';
+
       try {
-        const res = await fetch('/api/analytics/report');
-        const data = await res.json();
-        const p = data.pipeline || {};
-        const tth = data.time_to_hire || {};
-        const scores = data.scores || {};
-
-        let statsHtml = '<div class="stat-grid">';
-        statsHtml += '<div class="stat-card"><div class="stat-value">' + (p.total_candidates||0) + '</div><div class="stat-label">Total Candidates</div></div>';
-        statsHtml += '<div class="stat-card"><div class="stat-value">' + (p.average_score||0).toFixed(1) + '</div><div class="stat-label">Avg Score</div></div>';
-        statsHtml += '<div class="stat-card"><div class="stat-value">' + (tth.average_days||0).toFixed(1) + '</div><div class="stat-label">Avg Days to Hire</div></div>';
-        statsHtml += '<div class="stat-card"><div class="stat-value">' + (tth.hired_count||0) + '</div><div class="stat-label">Total Hired</div></div>';
-        statsHtml += '</div>';
-        document.getElementById('analytics-stats').innerHTML = statsHtml;
-
-        // Stage breakdown
-        let detailHtml = '<h3 style="color:var(--accent);margin-bottom:12px;">Pipeline Stages</h3>';
-        detailHtml += '<table><thead><tr><th>Stage</th><th>Count</th></tr></thead><tbody>';
-        const stages = p.stage_counts || {};
-        for (const [stage, count] of Object.entries(stages)) {
-          detailHtml += '<tr><td>' + stageBadge(stage) + '</td><td>' + count + '</td></tr>';
-        }
-        detailHtml += '</tbody></table>';
-
-        // Top candidates
-        const top = data.top_candidates || [];
-        if (top.length) {
-          detailHtml += '<h3 style="color:var(--accent);margin:16px 0 12px;">Top Candidates</h3>';
-          detailHtml += '<table><thead><tr><th>#</th><th>Name</th><th>Score</th><th>Stage</th></tr></thead><tbody>';
-          top.forEach((c, i) => {
-            detailHtml += '<tr><td>' + (i+1) + '</td><td>' + c.name + '</td><td>' + c.score.toFixed(1) + '</td><td>' + stageBadge(c.stage) + '</td></tr>';
-          });
-          detailHtml += '</tbody></table>';
-        }
-
-        document.getElementById('analytics-details').innerHTML = detailHtml;
-      } catch (err) {
-        document.getElementById('analytics-stats').innerHTML = '<div class="loading">Error: ' + err.message + '</div>';
+        const data = await fetchJson('/api/analytics/report');
+        state.analytics = data;
+        renderAnalytics(data);
+      } catch (error) {
+        bars.innerHTML = `<div class='error-state'>${escapeHtml(error.message)}</div>`;
+        highlights.innerHTML = `<div class='error-state'>Analytics request failed.</div>`;
+        document.getElementById('analyticsRaw').textContent = error.message;
+      } finally {
+        button.disabled = false;
+        setSystemStatus('Ready');
+        updateRefreshStamp();
       }
     }
+
+    async function refreshAll() {
+      await Promise.allSettled([loadCandidates(), loadAnalytics()]);
+    }
+
+    document.getElementById('prompt').addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        sendChat();
+      }
+    });
+
+    renderChatLog();
+    loadCandidates();
+    loadAnalytics();
   </script>
 </body>
 </html>

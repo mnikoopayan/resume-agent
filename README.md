@@ -107,6 +107,17 @@ cp config.example.env .env
 # Edit .env with your credentials (already configured if using the provided .env)
 ```
 
+### macOS note
+
+If this repo was copied from a Windows machine, the bundled `venv/` may contain Windows binaries and will not run on macOS. In that case, use the included helper scripts:
+
+```bash
+./setup_mac.sh
+./run_server_mac.sh
+```
+
+By default, `run_server_mac.sh` starts the server on port `8011` to avoid common conflicts with other local preview servers.
+
 ### Google API Setup
 
 For Gmail and Calendar integration, follow the detailed instructions in `GOOGLE_CALENDAR_GMAIL_SETUP.md`. In summary, you need to create a Google Cloud project, enable the Gmail and Calendar APIs, create OAuth 2.0 credentials, and download the `credentials.json` file to `google_api_server/`.

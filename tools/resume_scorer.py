@@ -16,6 +16,24 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _parse_json_or_csv_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not isinstance(value, str):
+        return []
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
 @dataclass
 class JobRequirement:
     """Configurable job requirement specification."""
@@ -177,37 +195,71 @@ class ResumeScorer:
             "phd": 100,
             "ph.d": 100,
             "doctorate": 100,
+            "doctor of philosophy": 100,
             "master": 85,
+            "masters": 85,
+            "master of science": 85,
+            "master of arts": 85,
             "mba": 85,
+            "ms": 85,
+            "m.s": 85,
             "m.s.": 85,
+            "ma": 85,
+            "m.a": 85,
             "m.a.": 85,
             "bachelor": 70,
+            "bachelors": 70,
+            "bachelor of science": 70,
+            "bachelor of arts": 70,
+            "bs": 70,
+            "b.s": 70,
             "b.s.": 70,
+            "ba": 70,
+            "b.a": 70,
             "b.a.": 70,
             "associate": 50,
             "diploma": 40,
             "certificate": 30,
         }
 
+        alias_groups = {
+            "phd": ["phd", "ph.d", "doctorate", "doctor of philosophy"],
+            "master": ["master", "masters", "master of science", "master of arts", "mba", "ms", "m.s", "m.s.", "ma", "m.a", "m.a."],
+            "bachelor": ["bachelor", "bachelors", "bachelor of science", "bachelor of arts", "bs", "b.s", "b.s.", "ba", "b.a", "b.a."],
+            "associate": ["associate"],
+            "diploma": ["diploma"],
+            "certificate": ["certificate"],
+        }
+
+        def _contains_term(term: str) -> bool:
+            normalized = re.escape(term.lower().strip())
+            pattern = rf"(?<![a-z]){normalized}(?![a-z])"
+            return re.search(pattern, edu_text) is not None
+
+        def _matches_requirement(term: str) -> bool:
+            lowered = term.lower().strip()
+            candidates = alias_groups.get(lowered, [lowered])
+            return any(_contains_term(candidate) for candidate in candidates)
+
         # Find highest education level
         highest_score = 0
         highest_level = "none"
         for level, level_score in education_levels.items():
-            if level in edu_text and level_score > highest_score:
+            if _contains_term(level) and level_score > highest_score:
                 highest_score = level_score
                 highest_level = level
 
         # Check required education
         required_met = False
         for req in requirements.required_education:
-            if req.lower() in edu_text:
+            if _matches_requirement(req):
                 required_met = True
                 break
 
         # Check preferred education
         preferred_met = False
         for pref in requirements.preferred_education:
-            if pref.lower() in edu_text:
+            if _matches_requirement(pref):
                 preferred_met = True
                 break
 
@@ -378,15 +430,8 @@ def create_scorer_tools(scorer: ResumeScorer) -> list:
         Returns:
             JSON with composite score, breakdown, and recommendation.
         """
-        try:
-            skills_list = json.loads(skills) if isinstance(skills, str) and skills.startswith("[") else [s.strip() for s in skills.split(",") if s.strip()]
-        except json.JSONDecodeError:
-            skills_list = [s.strip() for s in skills.split(",") if s.strip()]
-
-        try:
-            edu_list = json.loads(education) if isinstance(education, str) and education.startswith("[") else [education] if education else []
-        except json.JSONDecodeError:
-            edu_list = [education] if education else []
+        skills_list = _parse_json_or_csv_list(skills)
+        edu_list = _parse_json_or_csv_list(education)
 
         req = JobRequirement(
             title=job_title or scorer.default_requirements.title,

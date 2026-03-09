@@ -17,6 +17,10 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _clean_text(value: Optional[str]) -> str:
+    return (value or "").strip()
+
+
 class CandidateStage(str, Enum):
     """Pipeline stages for candidate tracking."""
     NEW = "NEW"
@@ -146,27 +150,43 @@ class CandidateDB:
         Returns:
             The new candidate ID.
         """
+        name = _clean_text(name)
+        email = _clean_text(email).lower()
+        phone = _clean_text(phone)
+        source = _clean_text(source) or "manual"
+        job_title_applied = _clean_text(job_title_applied)
+        notes = _clean_text(notes)
+        resume_text = (resume_text or "").strip()
+        if not name:
+            raise ValueError("Candidate name is required.")
+
         now = datetime.now(timezone.utc).isoformat()
         skills_json = json.dumps(skills or [])
         education_json = json.dumps(education or [])
 
         with self._get_conn() as conn:
-            # Check for duplicate by email
+            # Check for duplicate by email (case-insensitive).
             if email:
                 existing = conn.execute(
-                    "SELECT id FROM candidates WHERE email = ?", (email,)
+                    "SELECT id FROM candidates WHERE LOWER(email) = ?", (email,)
                 ).fetchone()
                 if existing:
                     logger.info("Candidate with email '%s' already exists (id=%s), updating.", email, existing["id"])
-                    self.update_candidate(
-                        existing["id"],
-                        name=name,
-                        phone=phone,
-                        skills=skills,
-                        experience_years=experience_years,
-                        education=education,
-                        resume_text=resume_text,
-                    )
+                    update_payload = {
+                        "name": name,
+                        "phone": phone,
+                        "skills": skills,
+                        "experience_years": experience_years,
+                        "education": education,
+                        "resume_text": resume_text,
+                    }
+                    if source:
+                        update_payload["source"] = source
+                    if job_title_applied:
+                        update_payload["job_title_applied"] = job_title_applied
+                    if notes:
+                        update_payload["notes"] = notes
+                    self.update_candidate(existing["id"], **update_payload)
                     return existing["id"]
 
             cursor = conn.execute(
@@ -238,6 +258,9 @@ class CandidateDB:
         Returns:
             List of candidate dictionaries.
         """
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+
         conditions = []
         params: List[Any] = []
 
@@ -389,6 +412,35 @@ class CandidateDB:
                 (candidate_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def search_candidates(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search candidates across name, email, job title, notes, and resume text.
+
+        Args:
+            query: Search string.
+            limit: Maximum number of results.
+
+        Returns:
+            List of matching candidate dictionaries.
+        """
+        limit = max(1, min(int(limit), 1000))
+        term = f"%{(query or '').lower()}%"
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM candidates
+                WHERE LOWER(name) LIKE ?
+                   OR LOWER(email) LIKE ?
+                   OR LOWER(job_title_applied) LIKE ?
+                   OR LOWER(notes) LIKE ?
+                   OR LOWER(resume_text) LIKE ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (term, term, term, term, term, limit),
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     def delete_candidate(self, candidate_id: int) -> bool:
         """

@@ -119,23 +119,29 @@ class CandidateRankingWorkflow:
             try:
                 skills = []
                 if candidate.get("skills"):
-                    try:
-                        skills = json.loads(candidate["skills"])
-                    except (json.JSONDecodeError, TypeError):
-                        skills = []
+                    if isinstance(candidate["skills"], list):
+                        skills = candidate["skills"]
+                    else:
+                        try:
+                            skills = json.loads(candidate["skills"])
+                        except (json.JSONDecodeError, TypeError):
+                            skills = []
 
                 education = []
                 if candidate.get("education"):
-                    try:
-                        education = json.loads(candidate["education"])
-                    except (json.JSONDecodeError, TypeError):
-                        education = [candidate["education"]] if candidate["education"] else []
+                    if isinstance(candidate["education"], list):
+                        education = candidate["education"]
+                    else:
+                        try:
+                            education = json.loads(candidate["education"])
+                        except (json.JSONDecodeError, TypeError):
+                            education = [candidate["education"]] if candidate["education"] else []
 
                 score_result = self.scorer.score_candidate(
                     candidate_skills=skills,
                     experience_years=candidate.get("experience_years", 0) or 0,
                     education_entries=education,
-                    resume_text=candidate.get("notes", ""),
+                    resume_text=candidate.get("resume_text", "") or candidate.get("notes", ""),
                     requirements=req,
                 )
 
@@ -154,6 +160,7 @@ class CandidateRankingWorkflow:
                     self.candidate_db.update_candidate(
                         candidate_id=candidate["id"],
                         score=score_result["composite_score"],
+                        score_breakdown=score_result.get("breakdown", {}),
                     )
                 except Exception as ue:
                     logger.warning(
@@ -182,9 +189,16 @@ class CandidateRankingWorkflow:
         # Step 4: Generate summary statistics
         if scored:
             scores = [s["composite_score"] for s in scored]
+            ordered_scores = sorted(scores)
+            mid = len(ordered_scores) // 2
+            median = (
+                ordered_scores[mid]
+                if len(ordered_scores) % 2 == 1
+                else (ordered_scores[mid - 1] + ordered_scores[mid]) / 2
+            )
             result.score_summary = {
                 "mean": round(sum(scores) / len(scores), 2),
-                "median": round(sorted(scores)[len(scores) // 2], 2),
+                "median": round(median, 2),
                 "min": round(min(scores), 2),
                 "max": round(max(scores), 2),
                 "above_threshold": sum(1 for s in scores if s >= self.advance_threshold),
@@ -200,8 +214,8 @@ class CandidateRankingWorkflow:
                 if entry["composite_score"] >= self.advance_threshold:
                     try:
                         current = entry.get("current_stage", "")
-                        # Only advance if not already past RANKED
-                        if current in ("NEW", "SCREENING", "INTERVIEW_SCHEDULED", "INTERVIEWED"):
+                        # Only advance when the pipeline rules allow a transition into RANKED.
+                        if current == "INTERVIEWED":
                             self.candidate_db.advance_stage(entry["candidate_id"], "RANKED")
                             advanced_count += 1
                     except Exception as e:

@@ -17,6 +17,7 @@ import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import getaddresses
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from pathlib import Path
@@ -27,6 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Read-only functions that are safe for resume screening workflows.
 READ_ONLY_GMAIL_FUNCTIONS = [
@@ -184,11 +186,10 @@ def create_full_gmail_tools(
     if credentials_path:
         base_kwargs["credentials_path"] = credentials_path
 
-    # IMPORTANT: keep read-only GmailTools from overwriting the canonical token.json.
+    # Full Gmail tools must use the canonical token so send/reply actions can
+    # access the latest full-scope credentials.
     main_token_path = _resolve_main_token_path(token_path)
-    readonly_token_path = _resolve_readonly_token_path(main_token_path)
-    _ensure_readonly_token_exists(readonly_token_path, main_token_path)
-    base_kwargs["token_path"] = readonly_token_path
+    base_kwargs["token_path"] = main_token_path
     if scopes:
         base_kwargs["scopes"] = list(scopes)
     if port is not None:
@@ -232,8 +233,21 @@ class SmtpGmailSender:
         self.smtp_port = smtp_port
 
     def _abs_path(self, path: str) -> str:
-        # Allow relative paths from project root.
-        return str(Path(path).expanduser().resolve())
+        """Resolve paths stably from the project root, not the caller's cwd."""
+        candidate = Path(path).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        return str((PROJECT_ROOT / candidate).resolve())
+
+    @staticmethod
+    def _parse_recipients(*values: str) -> List[str]:
+        recipients: List[str] = []
+        for _, addr in getaddresses(values):
+            addr = addr.strip()
+            if addr:
+                recipients.append(addr)
+        # Preserve order while deduplicating.
+        return list(dict.fromkeys(recipients))
 
     def _load_oauth_credentials(self, required_scopes: Optional[Sequence[str]] = None) -> Optional["Credentials"]:
         """
@@ -331,6 +345,13 @@ class SmtpGmailSender:
         Returns:
             Dictionary with send result.
         """
+        recipients = self._parse_recipients(to, cc, bcc)
+        if not recipients:
+            return {
+                "success": False,
+                "error": "At least one valid recipient email address is required.",
+            }
+
         token_exists = os.path.exists(self._abs_path(self.token_path))
 
         # 1) Prefer Gmail API (OAuth)
@@ -352,10 +373,11 @@ class SmtpGmailSender:
                 msg = MIMEMultipart("alternative")
                 if self.gmail_address:
                     msg["From"] = self.gmail_address
-                msg["To"] = to
+                msg["To"] = ", ".join(self._parse_recipients(to))
                 msg["Subject"] = subject
-                if cc:
-                    msg["Cc"] = cc
+                parsed_cc = self._parse_recipients(cc)
+                if parsed_cc:
+                    msg["Cc"] = ", ".join(parsed_cc)
                 if reply_to:
                     msg["Reply-To"] = reply_to
 
@@ -403,22 +425,17 @@ class SmtpGmailSender:
         try:
             msg = MIMEMultipart("alternative")
             msg["From"] = self.gmail_address
-            msg["To"] = to
+            msg["To"] = ", ".join(self._parse_recipients(to))
             msg["Subject"] = subject
 
-            if cc:
-                msg["Cc"] = cc
+            parsed_cc = self._parse_recipients(cc)
+            if parsed_cc:
+                msg["Cc"] = ", ".join(parsed_cc)
             if reply_to:
                 msg["Reply-To"] = reply_to
 
             content_type = "html" if html else "plain"
             msg.attach(MIMEText(body, content_type, "utf-8"))
-
-            recipients = [addr.strip() for addr in to.split(",") if addr.strip()]
-            if cc:
-                recipients.extend(addr.strip() for addr in cc.split(",") if addr.strip())
-            if bcc:
-                recipients.extend(addr.strip() for addr in bcc.split(",") if addr.strip())
 
             with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
                 server.ehlo()
@@ -458,6 +475,13 @@ class SmtpGmailSender:
         - For perfect threading, you'd also pass the Gmail threadId. This code keeps
           compatibility with the existing interface.
         """
+        recipients = self._parse_recipients(to)
+        if not recipients:
+            return {
+                "success": False,
+                "error": "A valid recipient email address is required for replies.",
+            }
+
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
 
@@ -480,7 +504,7 @@ class SmtpGmailSender:
                 msg = MIMEMultipart("alternative")
                 if self.gmail_address:
                     msg["From"] = self.gmail_address
-                msg["To"] = to
+                msg["To"] = ", ".join(recipients)
                 msg["Subject"] = subject
                 if in_reply_to:
                     msg["In-Reply-To"] = in_reply_to
@@ -514,7 +538,7 @@ class SmtpGmailSender:
         try:
             msg = MIMEMultipart("alternative")
             msg["From"] = self.gmail_address
-            msg["To"] = to
+            msg["To"] = ", ".join(recipients)
             msg["Subject"] = subject
             if in_reply_to:
                 msg["In-Reply-To"] = in_reply_to

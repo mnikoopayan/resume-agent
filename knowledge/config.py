@@ -13,6 +13,20 @@ from pathlib import Path
 from typing import List, Optional
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class KnowledgeConfig:
     """
@@ -85,7 +99,7 @@ class KnowledgeConfig:
                 "GMAIL_ATTACHMENTS_DIR", "./dropbox/gmail"
             ),
             gmail_query=os.getenv("GMAIL_QUERY", "in:inbox"),
-            gmail_max_results=int(os.getenv("GMAIL_MAX_RESULTS", "20")),
+            gmail_max_results=max(1, _env_int("GMAIL_MAX_RESULTS", 20)),
             gmail_unread_only=os.getenv("GMAIL_UNREAD_ONLY", "false").lower() == "true",
             google_credentials_path=os.getenv(
                 "GOOGLE_CREDENTIALS_PATH", "./google_api_server/credentials.json"
@@ -93,9 +107,7 @@ class KnowledgeConfig:
             google_token_path=os.getenv(
                 "GOOGLE_TOKEN_PATH", "./google_api_server/token.json"
             ),
-            scoring_advance_threshold=float(
-                os.getenv("SCORING_ADVANCE_THRESHOLD", "60.0")
-            ),
+            scoring_advance_threshold=_env_float("SCORING_ADVANCE_THRESHOLD", 60.0),
         )
 
     def ensure_directories(self) -> None:

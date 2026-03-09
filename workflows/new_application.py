@@ -14,6 +14,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tools.candidate_db import CandidateDB
@@ -24,6 +25,25 @@ from tools.knowledge_tool import InsertKnowledgeTool
 from tools.resume_scorer import ResumeScorer, JobRequirement
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _parse_json_or_csv_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not isinstance(value, str):
+        return []
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 @dataclass
@@ -111,6 +131,7 @@ class NewApplicationWorkflow:
         experience_years: int = 0,
         education: Optional[List[str]] = None,
         job_requirements: Optional[JobRequirement] = None,
+        dry_run: bool = False,
     ) -> ApplicationResult:
         """
         Process a new application through the full workflow.
@@ -126,11 +147,24 @@ class NewApplicationWorkflow:
             experience_years: Pre-extracted experience years.
             education: Pre-extracted education entries.
             job_requirements: Job requirements for scoring.
+            dry_run: When True, validate/classify/score without mutating the
+                database, knowledge base, or sending acknowledgments.
 
         Returns:
             ApplicationResult with processing details.
         """
         result = ApplicationResult()
+        classification = None
+
+        resolved_attachment_path: Optional[str] = None
+        if attachment_path:
+            attachment_candidate = Path(attachment_path).expanduser()
+            if not attachment_candidate.is_absolute():
+                attachment_candidate = (PROJECT_ROOT / attachment_candidate).resolve()
+            if attachment_candidate.exists() and attachment_candidate.is_file():
+                resolved_attachment_path = str(attachment_candidate)
+            else:
+                result.errors.append(f"Attachment not found: {attachment_path}")
 
         # Step 1: Classify the email
         try:
@@ -163,28 +197,31 @@ class NewApplicationWorkflow:
             result.candidate_email = from_email
 
         # Step 2: Create candidate profile
-        try:
-            candidate_id = self.candidate_db.create_candidate(
-                name=result.candidate_name,
-                email=result.candidate_email,
-                phone=getattr(classification, "extracted_phone", "") if "classification" in dir() else "",
-                source="email",
-                job_title_applied=getattr(classification, "extracted_position", "") if "classification" in dir() else "",
-                notes=f"Application via email: {subject}",
-            )
-            result.candidate_id = candidate_id
-            result.steps_completed.append("candidate_created")
-            logger.info("Created candidate #%d: %s", candidate_id, result.candidate_name)
-        except Exception as e:
-            logger.error("Failed to create candidate: %s", e)
-            result.errors.append(f"Candidate creation failed: {e}")
+        if dry_run:
+            result.steps_completed.append("candidate_creation_skipped_dry_run")
+        else:
+            try:
+                candidate_id = self.candidate_db.create_candidate(
+                    name=result.candidate_name,
+                    email=result.candidate_email,
+                    phone=getattr(classification, "extracted_phone", "") if classification is not None else "",
+                    source="email",
+                    job_title_applied=getattr(classification, "extracted_position", "") if classification is not None else "",
+                    notes=f"Application via email: {subject}",
+                )
+                result.candidate_id = candidate_id
+                result.steps_completed.append("candidate_created")
+                logger.info("Created candidate #%d: %s", candidate_id, result.candidate_name)
+            except Exception as e:
+                logger.error("Failed to create candidate: %s", e)
+                result.errors.append(f"Candidate creation failed: {e}")
 
         # Step 3: Insert resume into knowledge base
-        if self.knowledge_tool:
+        if self.knowledge_tool and not dry_run:
             try:
-                if attachment_path:
+                if resolved_attachment_path:
                     self.knowledge_tool.insert_knowledge(
-                        file_path=attachment_path, source="application"
+                        file_path=resolved_attachment_path, source="application"
                     )
                     result.knowledge_inserted = True
                     result.steps_completed.append("attachment_ingested")
@@ -226,8 +263,11 @@ class NewApplicationWorkflow:
                     self.candidate_db.update_candidate(
                         candidate_id=result.candidate_id,
                         score=result.score,
-                        skills=json.dumps(candidate_skills),
+                        score_breakdown=score_result.get("breakdown", {}),
+                        skills=candidate_skills,
                         experience_years=experience_years,
+                        education=candidate_education,
+                        resume_text=body,
                     )
                     result.steps_completed.append("score_saved")
                 except Exception as e:
@@ -242,10 +282,12 @@ class NewApplicationWorkflow:
             result.errors.append(f"Scoring failed: {e}")
 
         # Step 5: Send acknowledgment email
-        if self.auto_send_acknowledgment and result.candidate_email:
+        if dry_run:
+            result.steps_completed.append("acknowledgment_skipped_dry_run")
+        elif self.auto_send_acknowledgment and result.candidate_email:
             try:
                 position = ""
-                if "classification" in dir() and hasattr(classification, "extracted_position"):
+                if classification is not None and hasattr(classification, "extracted_position"):
                     position = classification.extracted_position
                 position = position or "Open Position"
 
@@ -273,7 +315,10 @@ class NewApplicationWorkflow:
                 result.errors.append(f"Acknowledgment failed: {e}")
 
         # Step 6: Advance to SCREENING
-        if result.candidate_id:
+        if dry_run:
+            result.stage = "SCREENING"
+            result.steps_completed.append("stage_advance_skipped_dry_run")
+        elif result.candidate_id:
             try:
                 self.candidate_db.advance_stage(result.candidate_id, "SCREENING")
                 result.stage = "SCREENING"
@@ -330,15 +375,8 @@ def create_workflow_tools(workflow: NewApplicationWorkflow) -> list:
         Returns:
             JSON with complete workflow result.
         """
-        try:
-            skills_list = json.loads(skills) if isinstance(skills, str) and skills.startswith("[") else []
-        except json.JSONDecodeError:
-            skills_list = []
-
-        try:
-            edu_list = json.loads(education) if isinstance(education, str) and education.startswith("[") else []
-        except json.JSONDecodeError:
-            edu_list = []
+        skills_list = _parse_json_or_csv_list(skills)
+        edu_list = _parse_json_or_csv_list(education)
 
         app_result = workflow.process(
             subject=subject,

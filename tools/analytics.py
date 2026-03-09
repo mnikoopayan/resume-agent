@@ -61,7 +61,7 @@ class AnalyticsEngine:
                 ).fetchone()
                 avg_score = round(avg_row["avg_score"], 2) if avg_row and avg_row["avg_score"] else 0.0
 
-                # Conversion rates
+                # Conversion rates based on observed stage transitions.
                 conversions = {}
                 stages_ordered = [
                     "NEW", "SCREENING", "INTERVIEW_SCHEDULED",
@@ -70,12 +70,31 @@ class AnalyticsEngine:
                 for i in range(len(stages_ordered) - 1):
                     from_stage = stages_ordered[i]
                     to_stage = stages_ordered[i + 1]
-                    from_count = stage_counts.get(from_stage, 0)
-                    # Count candidates who have passed through to_stage or beyond
-                    beyond_count = sum(
-                        stage_counts.get(s, 0) for s in stages_ordered[i + 1:]
-                    )
-                    rate = round((beyond_count / from_count * 100), 1) if from_count > 0 else 0.0
+                    if from_stage == "NEW":
+                        from_row = conn.execute(
+                            "SELECT COUNT(*) AS cnt FROM candidates"
+                        ).fetchone()
+                    else:
+                        from_row = conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT candidate_id) AS cnt
+                            FROM stage_history
+                            WHERE to_stage = ?
+                            """,
+                            (from_stage,),
+                        ).fetchone()
+                    from_count = from_row["cnt"] if from_row else 0
+
+                    transition_row = conn.execute(
+                        """
+                        SELECT COUNT(DISTINCT candidate_id) AS cnt
+                        FROM stage_history
+                        WHERE from_stage = ? AND to_stage = ?
+                        """,
+                        (from_stage, to_stage),
+                    ).fetchone()
+                    transitioned_count = transition_row["cnt"] if transition_row else 0
+                    rate = round((transitioned_count / from_count * 100), 1) if from_count > 0 else 0.0
                     conversions[f"{from_stage}_to_{to_stage}"] = rate
 
             return {
@@ -210,10 +229,15 @@ class AnalyticsEngine:
                     ranges["80-100 (Excellent)"] += 1
 
             n = len(scores)
+            if n % 2 == 1:
+                median = scores[n // 2]
+            else:
+                median = (scores[(n // 2) - 1] + scores[n // 2]) / 2
+
             return {
                 "count": n,
                 "mean": round(sum(scores) / n, 2),
-                "median": round(scores[n // 2], 2),
+                "median": round(median, 2),
                 "min": round(min(scores), 2),
                 "max": round(max(scores), 2),
                 "distribution": ranges,

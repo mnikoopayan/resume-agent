@@ -16,9 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-
-
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _safe_write_token(token_path: Path, creds_json: str) -> None:
@@ -71,15 +69,20 @@ class CalendarService:
             credentials_path: Path to Google OAuth client credentials JSON.
             token_path: Path to OAuth token JSON.
         """
-        self.credentials_path = Path(
-            credentials_path
-            or os.getenv("GOOGLE_CREDENTIALS_PATH", "./google_api_server/credentials.json")
+        credentials_value = credentials_path or os.getenv(
+            "GOOGLE_CREDENTIALS_PATH", "./google_api_server/credentials.json"
         )
-        self.token_path = Path(
-            token_path
-            or os.getenv("GOOGLE_TOKEN_PATH", "./google_api_server/token.json")
-        )
+        token_value = token_path or os.getenv("GOOGLE_TOKEN_PATH", "./google_api_server/token.json")
+        self.credentials_path = self._resolve_path(credentials_value)
+        self.token_path = self._resolve_path(token_value)
         self._service = None
+
+    @staticmethod
+    def _resolve_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return path.resolve()
+        return (PROJECT_ROOT / path).resolve()
 
     def _get_service(self):
         """Get or create the Google Calendar API service."""
@@ -189,6 +192,10 @@ class CalendarService:
         try:
             from dateutil import parser as date_parser
 
+            duration_minutes = int(duration_minutes)
+            if duration_minutes <= 0:
+                return []
+
             target_date = date_parser.parse(date).date()
             day_start = datetime(
                 target_date.year, target_date.month, target_date.day,
@@ -290,15 +297,12 @@ class CalendarService:
             if attendees:
                 event_body["attendees"] = [{"email": email} for email in attendees]
 
-            event = (
-                service.events()
-                .insert(
-                    calendarId="primary",
-                    body=event_body,
-                    sendNotifications=send_notifications,
-                )
-                .execute()
-            )
+            insert_kwargs = {
+                "calendarId": "primary",
+                "body": event_body,
+                "sendUpdates": "all" if send_notifications else "none",
+            }
+            event = service.events().insert(**insert_kwargs).execute()
 
             logger.info("Created calendar event: %s (id=%s)", summary, event.get("id"))
             return {

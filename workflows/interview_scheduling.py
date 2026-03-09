@@ -123,6 +123,7 @@ class InterviewSchedulingWorkflow:
         location: str = "",
         interview_format: Optional[str] = None,
         send_invitation: bool = True,
+        dry_run: bool = False,
     ) -> SchedulingResult:
         """
         Schedule an interview for a candidate.
@@ -135,6 +136,8 @@ class InterviewSchedulingWorkflow:
             location: Interview location or meeting link.
             interview_format: Interview format description.
             send_invitation: Whether to send invitation email.
+            dry_run: When True, validate and simulate scheduling without creating
+                calendar events, sending emails, or mutating candidate stage.
 
         Returns:
             SchedulingResult with full details.
@@ -192,35 +195,39 @@ class InterviewSchedulingWorkflow:
             logger.warning("Conflict check failed: %s", e)
             result.errors.append(f"Conflict check failed: {e}")
 
-        # Step 3: Create calendar event
-        try:
-            position_title = position or candidate.get("job_title_applied", "Open Position")
-            event_result = self.calendar_service.create_event(
-                summary=f"Interview: {result.candidate_name} — {position_title}",
-                start_time=start_time,
-                end_time=end_time,
-                description=(
-                    f"Interview for {position_title}\n"
-                    f"Candidate: {result.candidate_name}\n"
-                    f"Email: {result.candidate_email}\n"
-                    f"Format: {fmt}"
-                ),
-                location=location or "",
-                attendees=[result.candidate_email] if result.candidate_email else None,
-            )
-            if event_result.get("success"):
-                result.event_id = event_result.get("event_id", "")
-                result.steps_completed.append("calendar_event_created")
-            else:
-                result.errors.append(
-                    f"Calendar event creation failed: {event_result.get('error', 'unknown')}"
+        # Step 3: Create calendar event (or simulate in dry-run mode)
+        position_title = position or candidate.get("job_title_applied", "Open Position")
+        if dry_run:
+            result.event_id = "dry-run-event"
+            result.steps_completed.append("calendar_event_simulated")
+        else:
+            try:
+                event_result = self.calendar_service.create_event(
+                    summary=f"Interview: {result.candidate_name} — {position_title}",
+                    start_time=start_time,
+                    end_time=end_time,
+                    description=(
+                        f"Interview for {position_title}\n"
+                        f"Candidate: {result.candidate_name}\n"
+                        f"Email: {result.candidate_email}\n"
+                        f"Format: {fmt}"
+                    ),
+                    location=location or "",
+                    attendees=[result.candidate_email] if result.candidate_email else None,
                 )
-        except Exception as e:
-            logger.error("Calendar event creation failed: %s", e)
-            result.errors.append(f"Calendar event failed: {e}")
+                if event_result.get("success"):
+                    result.event_id = event_result.get("event_id", "")
+                    result.steps_completed.append("calendar_event_created")
+                else:
+                    result.errors.append(
+                        f"Calendar event creation failed: {event_result.get('error', 'unknown')}"
+                    )
+            except Exception as e:
+                logger.error("Calendar event creation failed: %s", e)
+                result.errors.append(f"Calendar event failed: {e}")
 
         # Step 4: Send invitation email
-        if send_invitation and result.candidate_email:
+        if send_invitation and result.candidate_email and not dry_run:
             try:
                 rendered = self.template_engine.render(
                     "interview_invitation",
@@ -250,19 +257,25 @@ class InterviewSchedulingWorkflow:
                 logger.error("Failed to send invitation: %s", e)
                 result.errors.append(f"Invitation failed: {e}")
 
-        # Step 5: Update candidate stage
-        try:
-            self.candidate_db.advance_stage(candidate_id, "INTERVIEW_SCHEDULED")
-            if result.event_id:
+        # Step 5: Update candidate stage only after a successful event creation.
+        if dry_run:
+            result.steps_completed.append("stage_update_skipped_dry_run")
+        elif result.event_id:
+            try:
+                self.candidate_db.advance_stage(candidate_id, "INTERVIEW_SCHEDULED")
                 self.candidate_db.update_candidate(
                     candidate_id=candidate_id,
+                    interview_datetime=start_time,
+                    interview_event_id=result.event_id,
                     notes=f"Interview scheduled: {start_time}, Event ID: {result.event_id}",
                 )
-            result.stage_updated = True
-            result.steps_completed.append("stage_updated")
-        except Exception as e:
-            logger.warning("Failed to update stage: %s", e)
-            result.errors.append(f"Stage update failed: {e}")
+                result.stage_updated = True
+                result.steps_completed.append("stage_updated")
+            except Exception as e:
+                logger.warning("Failed to update stage: %s", e)
+                result.errors.append(f"Stage update failed: {e}")
+        else:
+            result.errors.append("Stage update skipped because no calendar event was created.")
 
         result.success = len(result.errors) == 0
         logger.info(
