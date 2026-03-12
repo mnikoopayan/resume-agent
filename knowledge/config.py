@@ -34,9 +34,9 @@ class KnowledgeConfig:
     All settings can be overridden via environment variables.
     """
 
-    # LanceDB configuration
-    table_name: str = "knowledge_base"
-    uri: str = "./knowledge/lancedb"
+    # ChromaDB configuration
+    collection: str = "knowledge_base"
+    path: str = "./knowledge/chromadb"
 
     # Embedder configuration (OpenRouter only)
     openrouter_model: str = "openai/text-embedding-3-small"
@@ -82,8 +82,8 @@ class KnowledgeConfig:
             KnowledgeConfig populated from environment.
         """
         return cls(
-            table_name=os.getenv("KNOWLEDGE_TABLE_NAME", "knowledge_base"),
-            uri=os.getenv("KNOWLEDGE_URI", "./knowledge/lancedb"),
+            collection=os.getenv("KNOWLEDGE_COLLECTION", "knowledge_base"),
+            path=os.getenv("KNOWLEDGE_PATH", "./knowledge/chromadb"),
             openrouter_model=os.getenv(
                 "OPENROUTER_EMBEDDER_MODEL", "openai/text-embedding-3-small"
             ),
@@ -112,7 +112,7 @@ class KnowledgeConfig:
 
     def ensure_directories(self) -> None:
         """Ensure all required directories exist."""
-        Path(self.uri).mkdir(parents=True, exist_ok=True)
+        Path(self.path).mkdir(parents=True, exist_ok=True)
         Path(self.dropbox_path).mkdir(parents=True, exist_ok=True)
         Path(self.gmail_attachments_dir).mkdir(parents=True, exist_ok=True)
         Path(self.candidate_db_path).parent.mkdir(parents=True, exist_ok=True)
