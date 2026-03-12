@@ -34,8 +34,8 @@ ENV/
 *~
 
 # Knowledge base data
+knowledge/chromadb/
 knowledge/lancedb/
-*.lancedb
 knowledge/gmail_ingestion.db
 knowledge/candidates.db
 

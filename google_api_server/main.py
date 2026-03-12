@@ -26,7 +26,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -173,7 +173,7 @@ def _resolve_project_path(value: str) -> str:
 def _get_config() -> KnowledgeConfig:
     if "config" not in _SINGLETONS:
         config = KnowledgeConfig.from_env()
-        config.uri = _resolve_project_path(config.uri)
+        config.path = _resolve_project_path(config.path)
         config.dropbox_path = _resolve_project_path(config.dropbox_path)
         config.candidate_db_path = _resolve_project_path(config.candidate_db_path)
         config.gmail_db_path = _resolve_project_path(config.gmail_db_path)
@@ -334,7 +334,7 @@ class CandidateUpdate(BaseModel):
     phone: Optional[str] = None
     score: Optional[float] = None
     stage: Optional[str] = None
-    skills: Optional[List[str] | str] = None
+    skills: Optional[Union[List[str], str]] = None
     experience_years: Optional[int] = None
     notes: Optional[str] = None
     job_title_applied: Optional[str] = None

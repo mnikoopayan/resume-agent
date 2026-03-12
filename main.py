@@ -450,7 +450,7 @@ async def main():
 
     config = KnowledgeConfig.from_env()
     config.ensure_directories()
-    logger.info("Configuration loaded: table=%s, uri=%s", config.table_name, config.uri)
+    logger.info("Configuration loaded: collection=%s, path=%s", config.collection, config.path)
 
     # Parse mode
     mode = sys.argv[1] if len(sys.argv) > 1 else "demo"
